@@ -1,0 +1,45 @@
+# Build output
+bin/
+obj/
+dist/
+dist-fd/
+publish/
+out/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider / VS Code
+.idea/
+.vscode/
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+
+# Test and smoke-test artifacts
+_smoke_*.png
+_test_*.png
+_test_*.jpg
+*.coverage
+TestResults/
+
+# Logs
+*.log
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Local secrets
+*.env
+*.local.json
+appsettings.Development.json
+
+# Unrelated personal assets
+Video/
