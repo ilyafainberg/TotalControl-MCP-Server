@@ -61,7 +61,7 @@ By installing and running this software you accept the following:
 
 ## What it does
 
-Most automation tools (Selenium, Playwright, Power Automate Desktop)
+Most automation tools (Selenium, Playwright)
 target a specific surface. **TotalControl is surface-agnostic** — if a
 pixel can be drawn and an input can be received, an agent can read and
 write it:
