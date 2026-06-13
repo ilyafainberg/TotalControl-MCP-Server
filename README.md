@@ -150,7 +150,6 @@ find_element query="Notepad" name="File" controlType="menuitem" invoke=true
 
 ### 1. Drive apps without an API
 
-Power Automate Desktop, Power Apps, the Power Platform admin center,
 QuickBooks, SAP GUI, legacy WinForms LOB apps, installer wizards — if it
 runs on Windows, the agent can drive it. No "connector required",
 no "use the REST API instead", no extension points.
