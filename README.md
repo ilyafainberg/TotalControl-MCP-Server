@@ -10,7 +10,7 @@ MCP-compatible host (Claude Desktop, GitHub Copilot CLI, Continue, Cline,
 …).
 
 - **License:** MIT
-- **Stack:** .NET 9 · C# · `ModelContextProtocol` SDK · Win32 `SendInput` / `PrintWindow` · UI Automation
+- **Stack:** .NET 10 · C# · `ModelContextProtocol` SDK · Win32 `SendInput` / `PrintWindow` · UI Automation · WPF overlays · FFmpeg (optional, for recording)
 
 ---
 
@@ -81,7 +81,54 @@ For accessibility-aware apps the agent can skip pixels entirely and use
 
 ---
 
-## Tools (10)
+## Window control & the safety model
+
+Two problems plague desktop agents: they **click the wrong window** (the
+target was in the background and something else was on top at those
+coordinates), and the user has **no way to see or stop** what the agent is
+doing. TotalControl solves both with a mandatory *window selection* model.
+
+- **`control_window(query)`** pins a window **top-most**, brings it
+  forward, and draws a **crimson border** around it plus an **"Under Agent
+  Control"** tag with an **✕** button above its titlebar. Now the window the
+  agent screenshots and clicks is guaranteed to be the one on top, and the
+  user can *see* exactly which window is being driven.
+- **Enforcement gate (on by default).** Capture and interaction tools
+  **refuse to run until a window is selected** — they return an instruction
+  telling the agent to call `find_window` → `control_window` first. Absolute
+  tools (`screenshot_screen`, `click_mouse`, `send_keys`, …) require at
+  least one controlled window; window-scoped tools (`screenshot_window`,
+  `click_in_window`, `find_element`, `crop_screenshot`, `record_window`)
+  require *that* window to be controlled. Disable with the env var
+  `TOTALCONTROL_REQUIRE_WINDOW_SELECTION=0`.
+- **User abort.** Clicking the **✕** on the frame is an explicit **STOP**:
+  it cancels any in-flight operation (e.g. a recording) and the agent's next
+  tool call returns an `⛔ ABORTED BY USER` message instructing it to halt
+  and ask how to proceed.
+- **`release_window(query | all=true)`** removes the frame and restores the
+  window's original (non-top-most) state. The agent **must** release when
+  done; a process-exit safety-net un-top-mosts anything left behind.
+
+```text
+find_window                                  # discover windows (text, no capture)
+control_window query="Calculator"            # select + frame it (goes top-most)
+screenshot_window query="Calculator"         # now permitted
+click_in_window  query="Calculator" imageX=40 imageY=220
+release_window   query="Calculator"          # REQUIRED when finished
+```
+
+---
+
+## Tools (16)
+
+### Window control (start here)
+
+| Tool | Purpose |
+|---|---|
+| `find_window` | List visible top-level windows (title, process, PID, position) as **text** — no screenshot, always allowed. Use it to discover targets. |
+| `control_window` | **Select** a window: pin it top-most, bring it forward, draw the crimson "Under Agent Control" frame + ✕ button. Required before capture/interaction (enforced). |
+| `release_window` | Remove the frame and restore the window's original state. Pass `all=true` to release everything. |
+| `record_window` | Screen-record a controlled window to an **MP4** (H.264) for a fixed duration. Needs FFmpeg. Abortable via ✕. |
 
 ### Input
 
@@ -91,15 +138,17 @@ For accessibility-aware apps the agent can skip pixels entirely and use
 | `click_mouse` | Synthesize left / right / middle click at the current or given position. Supports double-click. |
 | `mouse_button` | Press OR release a single button (low-level drag primitive). Use when you need a button held while the cursor moves. |
 | `drag_mouse` | Atomic drag: press at `(startX, startY)` → glide through intermediate `WM_MOUSEMOVE` events → release at `(endX, endY)`. Works for drag-and-drop, marquee selection, sliders, paint strokes, card games. |
+| `scroll_mouse` | Scroll the mouse wheel (vertical or horizontal) at the current or a given position. |
 | `send_keys` | Type text and named keys / chords into whichever window has focus. |
 
 ### Vision
 
 | Tool | Purpose |
 |---|---|
-| `screenshot_screen` | Capture the primary monitor (or full virtual screen across all displays). |
-| `screenshot_window` | Capture a specific app window by title or process name — even if covered or minimized. |
-| `hover_preview` | Move the cursor to `(x, y)`, then return a small crop with a yellow+black crosshair drawn at the target. Lets the agent verify it's about to click the right pixel **before** committing. |
+| `screenshot_screen` | Capture the primary monitor (or full virtual screen across all displays). Supports `scale` + `jpegQuality` to cut token cost. |
+| `screenshot_window` | Capture a specific app window by title or process name — even if covered or minimized. Supports `scale` + `jpegQuality`. |
+| `crop_screenshot` | Capture only a sub-region of the screen or a window (region-of-interest) — the cheapest way to read one dialog/element. |
+| `hover_preview` | Move the cursor to `(x, y)`, then return a small crop with a yellow+black crosshair drawn at the target. Verify you're about to click the right pixel **before** committing. |
 
 ### High-level
 
@@ -107,6 +156,12 @@ For accessibility-aware apps the agent can skip pixels entirely and use
 |---|---|
 | `click_in_window` | Click at *window-relative* coordinates (e.g. "the pixel at (200, 80) inside Notepad"). The server resolves the window's screen origin and does the math — eliminates a whole class of "operator error" coordinate bugs. |
 | `find_element` | Walk the UI Automation tree of a window. Find a control by Name / AutomationId / ControlType, return its bounding rect and center, optionally activate it via the accessibility layer (Invoke / Toggle / SelectionItem / ExpandCollapse). Bypasses the synthetic-input restrictions that block clicks on UWP / AppContainer apps. |
+
+### Performance knobs (screenshots)
+
+- `scale=0.5` — halve both dimensions (~4× smaller file); great for navigation shots.
+- `jpegQuality=75` — JPEG instead of PNG (~15× smaller); good for reading text.
+- `crop_screenshot` — capture only the region of interest.
 
 ### `send_keys` syntax
 
@@ -128,6 +183,10 @@ Supported named keys: `Enter`, `Return`, `Tab`, `Esc`/`Escape`, `Space`,
 ### Cheat-sheet examples
 
 ```text
+# Always select the window first (enforced):
+find_window filter="Notepad"
+control_window query="Notepad"
+
 send_keys "Save the file{Ctrl+S}"
 send_keys "{Win+R}notepad{Enter}"
 send_keys "{Ctrl+A}{Delete}New content here.{Enter}"
@@ -135,14 +194,37 @@ send_keys "{Ctrl+A}{Delete}New content here.{Enter}"
 click_mouse button=right x=820 y=440
 click_in_window query="Notepad" imageX=200 imageY=80     # window-relative
 hover_preview x=820 y=440 radius=60                       # verify-before-click
+scroll_mouse amount=-5                                    # scroll down 5 notches
 
 drag_mouse startX=120 startY=400 endX=540 endY=400        # marquee / drag-drop
 mouse_button action=down button=left x=120 y=400          # low-level grab
 mouse_button action=up   button=left                      # …release
 
-screenshot_window query="Visual Studio Code"
+screenshot_window query="Notepad" scale=0.5 jpegQuality=75
+crop_screenshot window="Notepad" x=200 y=150 width=400 height=200
 find_element query="Notepad" name="File" controlType="menuitem" invoke=true
+record_window query="Notepad" durationSeconds=10 fps=15   # → MP4
+
+release_window all=true                                   # REQUIRED when done
 ```
+
+### Recording windows to MP4
+
+`record_window` captures a **controlled** window to an H.264 MP4 using the
+same DWM-aware capture as `screenshot_window`, piped to FFmpeg:
+
+```text
+control_window query="Visual Studio Code"
+record_window  query="Visual Studio Code" durationSeconds=20 fps=15
+# → %USERPROFILE%\Videos\TotalControl\<title>_<timestamp>.mp4
+```
+
+- Requires **FFmpeg** on `PATH` (or set `TOTALCONTROL_FFMPEG` to its full
+  path). Install: `winget install Gyan.FFmpeg`.
+- The call **blocks** for `durationSeconds` (1–300). The "Under Agent
+  Control" frame is **not** captured — only the window's own pixels.
+- Clicking **✕** on the frame stops the recording early; the partial MP4 is
+  still finalized.
 
 ---
 
@@ -219,7 +301,7 @@ copy-paste-massage-paste loops. The agent doesn't get bored.
 
 ## Build from source
 
-Requires **.NET 9 SDK** on Windows 10 / 11.
+Requires **.NET 10 SDK** on Windows 10 / 11.
 
 ```powershell
 git clone https://github.com/ilyafainberg/TotalControl-MCP-Server.git TotalControl
@@ -236,11 +318,11 @@ dotnet publish -c Release -r win-x64 --self-contained true `
   -o .\dist
 ```
 
-Output: `dist\TotalControl.exe` (~130 MB self-contained, includes .NET 9
+Output: `dist\TotalControl.exe` (~140 MB self-contained, includes the .NET 10
 runtime + WPF + UI Automation libraries).
 
-For a smaller framework-dependent build (requires .NET 9 on the target
-machine, ~160 KB):
+For a smaller framework-dependent build (requires .NET 10 on the target
+machine):
 
 ```powershell
 dotnet publish -c Release -o .\dist-fd
@@ -344,7 +426,7 @@ Cline, Cursor, Goose, Zed, etc. Point the host's MCP config at
                                         │  └─────────────┬──────────────┘  │
                                         │                │                  │
                                         │  ┌─────────────▼──────────────┐  │
-                                        │  │ DesktopTools (10 tools)    │  │
+                                        │  │ DesktopTools (16 tools)    │  │
                                         │  └─────────────┬──────────────┘  │
                                         │                │                  │
                                         │  ┌─────────────▼──────────────┐  │
@@ -365,11 +447,14 @@ Cline, Cursor, Goose, Zed, etc. Point the host's MCP config at
 | File | Responsibility |
 |---|---|
 | `Program.cs` | Hosts the MCP server over stdio, registers tools, ships agent-facing server instructions. |
-| `DesktopTools.cs` | The 10 MCP tools with rich `[Description]` metadata so the agent picks them correctly. |
-| `KeySequenceParser.cs` | Tokenizes `{Ctrl+S}` / `{Tab 5}` / Unicode text into Win32 `INPUT` events. |
-| `Win32.cs` | P/Invoke declarations: `SendInput`, `PrintWindow`, `EnumWindows`, `DwmGetWindowAttribute`, mouse flag enum (including `VirtualDesk` for absolute-coordinate drags), VK constants. |
+| `DesktopTools.cs` | The 16 MCP tools with rich `[Description]` metadata so the agent picks them correctly. |
+| `WindowControl.cs` | The "Under Agent Control" overlay frames (WPF, on a dedicated STA thread), top-most management, follow-timer, and the enforcement gate. |
+| `AgentSession.cs` | User-abort state: the ✕ button cancels in-flight operations and arms a one-shot abort flag surfaced to the agent's next tool call. |
+| `ScreenRecorder.cs` | Records a window to MP4 by piping DWM-aware `PrintWindow` frames (raw BGRA) to FFmpeg (H.264). |
+| `KeySequenceParser.cs` | Tokenizes `{Ctrl+S}` / `{Tab 5}` / Unicode text into Win32 `INPUT` events. Chords resolve to VK codes (via `VkKeyScanW`) so hotkeys like `{Win+R}` actually fire. |
+| `Win32.cs` | P/Invoke declarations: `SendInput`, `PrintWindow`, `EnumWindows`, `DwmGetWindowAttribute`, `SetWindowPos`, `GetDpiForWindow`, mouse/key flag enums, VK constants. |
 | `app.manifest` | Declares Per-Monitor V2 DPI awareness — screenshots and clicks line up at physical pixels on HiDPI displays. |
-| `test_*.py` | JSON-RPC stdio smoke tests for pixel accuracy, UIA lookup, and the new v1.2.0 tools. |
+| `test_*.py` | JSON-RPC stdio smoke tests for pixel accuracy, UIA lookup, keyboard/mouse, the enforcement gate, window control, and recording. |
 
 ---
 

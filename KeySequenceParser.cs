@@ -21,6 +21,8 @@ namespace TotalControl;
 ///                              Up, Down, Left, Right, Home, End, PageUp, PageDown,
 ///                              Insert, CapsLock, NumLock, Win, Apps,
 ///                              F1..F24, VolumeUp/Down/Mute, Play, NextTrack, PrevTrack
+///   • {Modifier}        → a lone modifier tapped on its own: {Win} (opens Start),
+///                          {Ctrl}, {Alt}, {Shift}.
 ///   • {Mod+Mod+Key}     → chord. Modifiers: Ctrl, Alt, Shift, Win.
 ///                          Example: {Ctrl+S}, {Ctrl+Shift+T}, {Win+R}, {Alt+F4}
 ///   • {Key N}     → repeat N times. Example: {Tab 5}, {Backspace 10}
@@ -140,13 +142,34 @@ internal static class KeySequenceParser
             // Resolution order for the main key: named → function key → single char → multi-char-under-modifier.
             if (NamedKeys.TryGetValue(part, out var vk))         { mainVk = vk; }
             else if (TryParseFunctionKey(part, out vk))           { mainVk = vk; }
-            else if (part.Length == 1)                            { mainText = part; }
+            else if (part.Length == 1)
+            {
+                // A single character with modifiers held (e.g. {Ctrl+S}, {Win+R}, {Alt+F}) MUST be
+                // sent as a virtual-key code: the OS hotkey/accelerator machinery keys off VK codes,
+                // and Unicode injection (wVk=0) is invisible to it — so Win+R, Ctrl+S etc. would
+                // otherwise never fire. Without modifiers, plain text goes through the Unicode path.
+                if (modifiers.Count > 0) { mainVk = CharToVk(part[0]); }
+                else                     { mainText = part; }
+            }
             else if (part.Length > 1 && modifiers.Count > 0)      { mainText = part; }
             else throw new FormatException($"Unknown key '{part}' in token '{token}'.");
         }
 
         if (mainVk is null && mainText is null)
+        {
+            // Lone modifier token: {Win}, {Ctrl}, {Shift}, {Alt}. Press and release the
+            // modifier as a standalone key — e.g. {Win} taps the Windows key to open Start.
+            if (modifiers.Count > 0)
+            {
+                for (int r = 0; r < repeat; r++)
+                {
+                    foreach (var mod in modifiers) AppendVk(inputs, mod, down: true);
+                    for (int m = modifiers.Count - 1; m >= 0; m--) AppendVk(inputs, modifiers[m], down: false);
+                }
+                return;
+            }
             throw new FormatException($"Token '{token}' has no main key.");
+        }
 
         // Emit `repeat` chord iterations. Modifiers are released in reverse
         // order so that nested combinations behave symmetrically.
@@ -179,6 +202,20 @@ internal static class KeySequenceParser
             return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// Resolve a single character to its virtual-key code on the current keyboard
+    /// layout (the low byte of VkKeyScanW). The high byte carries the shift state,
+    /// which we ignore: chord modifiers are supplied explicitly by the caller, so a
+    /// token like {Ctrl+S} holds Ctrl and presses VK_S regardless of letter casing.
+    /// </summary>
+    private static ushort CharToVk(char c)
+    {
+        short res = Win32.VkKeyScanW(c);
+        if (res == -1)
+            throw new FormatException($"No virtual-key mapping for '{c}' on the current keyboard layout. Use a named key or a different character.");
+        return (ushort)(res & 0xFF);
     }
 
     /// <summary>

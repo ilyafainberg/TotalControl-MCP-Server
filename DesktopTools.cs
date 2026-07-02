@@ -11,9 +11,15 @@
 //      click_mouse          Synthesize a left/right/middle click (single or double).
 //      mouse_button         Press OR release a mouse button (low-level drag primitive).
 //      drag_mouse           High-level press → move → release drag in one atomic call.
+//      scroll_mouse         Scroll the mouse wheel at a given position (vertical or horizontal).
 //      send_keys            Type Unicode text + named keys / chords into focus.
 //      screenshot_screen    Capture the primary monitor or the full virtual screen.
 //      screenshot_window    Capture a specific app window by title or process name.
+//      crop_screenshot      Capture a sub-region of the screen or a window (region-of-interest).
+//      find_window          List visible top-level windows matching an optional filter — no capture.
+//      control_window       Pin a window top-most + draw an "Under Agent Control" frame.
+//      release_window       Remove the frame and restore a controlled window's state.
+//      record_window        Screen-record a controlled window to an MP4 (H.264, via FFmpeg).
 //      click_in_window      Click at WINDOW-relative coords — server does the math.
 //      hover_preview        Move cursor, return a small crop with crosshair overlay.
 //      find_element         UI Automation tree walk; locate (and optionally invoke) a control.
@@ -24,6 +30,7 @@
 //  recommended see → act → verify loop.
 // -----------------------------------------------------------------------------
 
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
@@ -42,12 +49,35 @@ using Rectangle = System.Drawing.Rectangle;
 using Color = System.Drawing.Color;
 using Pen = System.Drawing.Pen;
 using Bitmap = System.Drawing.Bitmap;
+using InterpolationMode = System.Drawing.Drawing2D.InterpolationMode;
 
 namespace TotalControl;
 
 [McpServerToolType]
 public static class DesktopTools
 {
+    // -----------------------------------------------------------------------
+    //  Process-name cache
+    //  EnumerateTopLevelWindows previously called Process.GetProcessById for
+    //  every visible window on every tool call — one kernel call per window.
+    //  A short-TTL static cache reduces that to one lookup per unique PID
+    //  per 10-second window (processes don't normally start/exit that fast).
+    // -----------------------------------------------------------------------
+    private sealed record ProcEntry(string Name, long ExpiresAt);
+    private static readonly ConcurrentDictionary<uint, ProcEntry> ProcessNameCache = new();
+    private const long ProcessCacheTtl = 10 * TimeSpan.TicksPerSecond;
+
+    private static string GetProcessName(uint pid)
+    {
+        long now = DateTime.UtcNow.Ticks;
+        if (ProcessNameCache.TryGetValue(pid, out var entry) && entry.ExpiresAt > now)
+            return entry.Name;
+        string name;
+        try { using var pr = Process.GetProcessById((int)pid); name = pr.ProcessName; }
+        catch { name = "?"; }
+        ProcessNameCache[pid] = new ProcEntry(name, now + ProcessCacheTtl);
+        return name;
+    }
     // ============================================================
     //  MOUSE
     // ============================================================
@@ -99,6 +129,9 @@ public static class DesktopTools
     {
         if (count < 1 || count > 5) throw new ArgumentOutOfRangeException(nameof(count), "count must be 1..5.");
         if ((x is null) ^ (y is null)) throw new ArgumentException("x and y must be provided together.");
+
+        var gate = Enforcement.GateAny("click_mouse");
+        if (gate is not null) return gate;
 
         if (x is int xi && y is int yi)
         {
@@ -158,6 +191,9 @@ public static class DesktopTools
     {
         if ((x is null) ^ (y is null)) throw new ArgumentException("x and y must be provided together.");
 
+        var gate = Enforcement.GateAny("mouse_button");
+        if (gate is not null) return gate;
+
         var act = action?.ToLowerInvariant();
         bool isDown = act switch
         {
@@ -196,13 +232,16 @@ public static class DesktopTools
         "sends those move events at hardware level (SendInput with MOUSEEVENTF_MOVE/ABSOLUTE/VIRTUALDESK), " +
         "so Explorer, file managers, design tools, web pages, and IDE tabs all recognize the gesture.\n" +
         "Tuning:\n" +
-        "  • 'steps' (default 20) — number of intermediate WM_MOUSEMOVE events along the path. Increase " +
-        "for slow, smooth drags (e.g. painting) or for finicky surfaces that need ≥10 movement frames.\n" +
-        "  • 'stepDelayMs' (default 8) — milliseconds to sleep between move events. Total drag time is " +
-        "roughly steps × stepDelayMs. Keep it small for snappy drags; bump for sluggish targets.\n" +
-        "  • 'holdAfterMs' (default 30) — pause between the last move and the button release. A few apps " +
+        "  • 'downDelayMs' (default 20) — pause AFTER the button-down BEFORE the first move event. " +
+        "Required by DragDetect-based apps: they wait for at least one timer tick between down and the " +
+        "first move before classifying the gesture as a drag. Bump to 50–100 for stubborn apps.\n" +
+        "  • 'steps' (default 20) — number of WM_MOUSEMOVE events along the path. By default all steps " +
+        "are batched into one SendInput call (fastest). Set stepDelayMs > 0 to spread them out instead.\n" +
+        "  • 'stepDelayMs' (default 0) — ms between successive move events when > 0. Set to 8–16 for " +
+        "slow, observable drags or apps that animate step-by-step.\n" +
+        "  • 'holdAfterMs' (default 30) — pause between the last move and button release. A few apps " +
         "need ~50–200 ms here to register the drop.\n" +
-        "Returns the resulting cursor position and the path summary.")]
+        "Returns the resulting cursor position and path summary.")]
     public static string DragMouse(
         [Description("X coordinate of the drag START in physical pixels.")] int startX,
         [Description("Y coordinate of the drag START in physical pixels.")] int startY,
@@ -212,14 +251,20 @@ public static class DesktopTools
         string button = "left",
         [Description("Number of intermediate WM_MOUSEMOVE events along the path. Default 20. Range 1..1000.")]
         int steps = 20,
-        [Description("Milliseconds to wait between successive move events. Default 8. Range 0..1000.")]
-        int stepDelayMs = 8,
+        [Description("Milliseconds to wait between successive move events. 0 = batch all moves in one SendInput call (fastest, default). Range 0..1000.")]
+        int stepDelayMs = 0,
         [Description("Milliseconds to pause after the final move, before releasing the button. Default 30. Range 0..5000.")]
-        int holdAfterMs = 30)
+        int holdAfterMs = 30,
+        [Description("Milliseconds to pause AFTER button-down BEFORE the first move event. Default 20. DragDetect-based apps require at least one tick between down and first move. Bump to 50–100 for stubborn targets. Range 0..5000.")]
+        int downDelayMs = 20)
     {
-        if (steps < 1 || steps > 1000) throw new ArgumentOutOfRangeException(nameof(steps), "steps must be 1..1000.");
-        if (stepDelayMs < 0 || stepDelayMs > 1000) throw new ArgumentOutOfRangeException(nameof(stepDelayMs), "stepDelayMs must be 0..1000.");
-        if (holdAfterMs < 0 || holdAfterMs > 5000) throw new ArgumentOutOfRangeException(nameof(holdAfterMs), "holdAfterMs must be 0..5000.");
+        if (steps        < 1    || steps        > 1000) throw new ArgumentOutOfRangeException(nameof(steps),        "steps must be 1..1000.");
+        if (stepDelayMs  < 0    || stepDelayMs  > 1000) throw new ArgumentOutOfRangeException(nameof(stepDelayMs),  "stepDelayMs must be 0..1000.");
+        if (holdAfterMs  < 0    || holdAfterMs  > 5000) throw new ArgumentOutOfRangeException(nameof(holdAfterMs),  "holdAfterMs must be 0..5000.");
+        if (downDelayMs  < 0    || downDelayMs  > 5000) throw new ArgumentOutOfRangeException(nameof(downDelayMs),  "downDelayMs must be 0..5000.");
+
+        var gate = Enforcement.GateAny("drag_mouse");
+        if (gate is not null) return gate;
 
         var (down, up) = button.ToLowerInvariant() switch
         {
@@ -229,39 +274,127 @@ public static class DesktopTools
             _ => throw new ArgumentException($"Unknown button '{button}'. Use 'left', 'right' or 'middle'."),
         };
 
-        // 1. Park the cursor at the start position so the button-down lands precisely.
+        // Cache virtual screen bounds ONCE — AbsoluteMoveEventRaw uses these on every step,
+        // so calling GetSystemMetrics 4× per step (as the old single-event path did) is wasteful.
+        int vx = Win32.GetSystemMetrics(Win32.SM_XVIRTUALSCREEN);
+        int vy = Win32.GetSystemMetrics(Win32.SM_YVIRTUALSCREEN);
+        int vw = Math.Max(1, Win32.GetSystemMetrics(Win32.SM_CXVIRTUALSCREEN));
+        int vh = Math.Max(1, Win32.GetSystemMetrics(Win32.SM_CYVIRTUALSCREEN));
+
+        // 1. Park the cursor at the start position.
         if (!Win32.SetCursorPos(startX, startY))
             throw new InvalidOperationException($"SetCursorPos({startX},{startY}) failed (Win32 error {Marshal.GetLastWin32Error()}).");
 
-        // 2. Button down at start. We also emit an ABSOLUTE move to the start so apps that
-        //    track WM_MOUSEMOVE before the click (hit-testing) see a clean entry event.
+        // 2. Absolute-move to start + button-down in a single SendInput call.
+        //    Sending the move event ensures apps that track cursor position before
+        //    the click (hit-testing, hover highlighting) see a clean entry event.
         SendInputs(new[]
         {
-            AbsoluteMoveEvent(startX, startY),
+            AbsoluteMoveEventRaw(startX, startY, vx, vy, vw, vh),
             MouseEvent(down),
         });
 
-        // 3. Glide through `steps` intermediate points using linear interpolation. Each
-        //    sub-step is sent as MOUSEEVENTF_MOVE + ABSOLUTE + VIRTUALDESK so receiving
-        //    windows get real WM_MOUSEMOVE messages (SetCursorPos alone is not enough —
-        //    DragDetect listens for WM_MOUSEMOVE between button down and up).
+        // 3. Pause after button-down so DragDetect-based apps (Explorer, Office, …)
+        //    have time to arm the drag threshold before the first WM_MOUSEMOVE arrives.
+        if (downDelayMs > 0) Thread.Sleep(downDelayMs);
+
+        // 4. Build all intermediate move events.
+        var moveEvents = new Win32.INPUT[steps];
         for (int i = 1; i <= steps; i++)
         {
             double t = (double)i / steps;
             int x = (int)Math.Round(startX + (endX - startX) * t);
             int y = (int)Math.Round(startY + (endY - startY) * t);
-            SendInputs(new[] { AbsoluteMoveEvent(x, y) });
-            if (stepDelayMs > 0) Thread.Sleep(stepDelayMs);
+            moveEvents[i - 1] = AbsoluteMoveEventRaw(x, y, vx, vy, vw, vh);
         }
 
-        // 4. Optional dwell at the destination so the receiving app can register the drop.
+        if (stepDelayMs > 0)
+        {
+            // Slow/observable mode: one OS call per step with a delay in between.
+            foreach (var ev in moveEvents)
+            {
+                SendInputs(new[] { ev });
+                Thread.Sleep(stepDelayMs);
+            }
+        }
+        else
+        {
+            // Fast mode (default): all move events in ONE SendInput call.
+            // The OS enqueues them atomically — no other thread can sneak events
+            // in between, and we halve the number of user→kernel transitions.
+            SendInputs(moveEvents);
+        }
+
+        // 5. Snap cursor exactly to the endpoint before releasing the button.
+        //    Normalization rounding in AbsoluteMoveEventRaw can be off by ±1 pixel;
+        //    SetCursorPos gives us a byte-perfect landing position.
+        Win32.SetCursorPos(endX, endY);
         if (holdAfterMs > 0) Thread.Sleep(holdAfterMs);
 
-        // 5. Release.
+        // 6. Release.
         SendInputs(new[] { MouseEvent(up) });
 
         Win32.GetCursorPos(out var p);
         return $"{button} drag ({startX},{startY}) → ({endX},{endY}) over {steps} step(s); cursor now at ({p.X}, {p.Y}).";
+    }
+
+    [McpServerTool(Name = "scroll_mouse")]
+    [Description(
+        "Scrolls the mouse wheel at the current cursor position (or at an optional (x, y) position).\n" +
+        "Use for: scrolling web pages, lists, code editors, zooming canvas areas, navigating menus.\n" +
+        "Parameters:\n" +
+        "  • 'amount' — number of scroll 'clicks'. Positive = scroll UP (or RIGHT for horizontal). " +
+        "Negative = scroll DOWN (or LEFT). One click = 120 raw delta units (one WHEEL_DELTA notch). " +
+        "Typical values: 3 (three notches up) or -5 (five notches down). Default 3.\n" +
+        "  • 'horizontal' — false (default) scrolls the vertical wheel; true scrolls horizontal.\n" +
+        "  • 'x', 'y' — optional screen coordinates. If supplied, the cursor moves there first.")]
+    public static string ScrollMouse(
+        [Description("Number of wheel notches. Positive = up/right. Negative = down/left. Default 3. Range -50..50.")]
+        int amount = 3,
+        [Description("If true, scroll horizontally (left/right). Default false (vertical).")]
+        bool horizontal = false,
+        [Description("Optional X coordinate (physical pixels) to move to before scrolling. Omit to scroll in place.")]
+        int? x = null,
+        [Description("Optional Y coordinate. Must be provided together with x.")]
+        int? y = null)
+    {
+        if (amount < -50 || amount > 50) throw new ArgumentOutOfRangeException(nameof(amount), "amount must be -50..50.");
+        if (x.HasValue != y.HasValue) throw new ArgumentException("x and y must be provided together.");
+
+        var gate = Enforcement.GateAny("scroll_mouse");
+        if (gate is not null) return gate;
+
+        if (x.HasValue && y.HasValue)
+        {
+            if (!Win32.SetCursorPos(x.Value, y.Value))
+                throw new InvalidOperationException($"SetCursorPos({x},{y}) failed (Win32 error {Marshal.GetLastWin32Error()}).");
+        }
+
+        // Each SendInput wheel event carries one WHEEL_DELTA (120). We batch all notches
+        // into a single call so they arrive as one uninterrupted burst.
+        int delta = amount * 120; // total raw delta; OS divides back into notches for the app
+        var flag = horizontal ? Win32.MouseEventF.HWheel : Win32.MouseEventF.Wheel;
+
+        // mouseData carries the signed delta but the INPUT struct field is uint — cast via int.
+        SendInputs(new[]
+        {
+            new Win32.INPUT
+            {
+                type = Win32.INPUT_MOUSE,
+                U = new Win32.INPUTUNION
+                {
+                    mi = new Win32.MOUSEINPUT
+                    {
+                        mouseData = unchecked((uint)delta),
+                        dwFlags   = (uint)flag,
+                    }
+                }
+            }
+        });
+
+        Win32.GetCursorPos(out var p);
+        var dir = horizontal ? (amount > 0 ? "right" : "left") : (amount > 0 ? "up" : "down");
+        return $"Scrolled {Math.Abs(amount)} notch(es) {dir} at cursor ({p.X},{p.Y}).";
     }
 
     // ============================================================
@@ -296,6 +429,10 @@ public static class DesktopTools
         string keys)
     {
         if (string.IsNullOrEmpty(keys)) return "0 keystrokes sent.";
+
+        var gate = Enforcement.GateAny("send_keys");
+        if (gate is not null) return gate;
+
         var inputs = KeySequenceParser.Parse(keys);
         SendInputs(inputs);
         return $"{inputs.Count} key event(s) sent.";
@@ -307,18 +444,29 @@ public static class DesktopTools
 
     [McpServerTool(Name = "screenshot_screen")]
     [Description(
-        "Captures a PNG screenshot of the desktop and returns it INLINE as an image content block so you " +
-        "can visually reason about the current screen state.\n" +
-        "Default behavior: captures the PRIMARY monitor only (most efficient, ~1–3 MB).\n" +
+        "Captures a PNG (or JPEG) screenshot of the desktop and returns it INLINE as an image content " +
+        "block so you can visually reason about the current screen state.\n" +
+        "Default behavior: captures the PRIMARY monitor only (most efficient).\n" +
         "Set 'allMonitors=true' to capture the full virtual screen across every connected display.\n" +
-        "USE THIS BEFORE EVERY DECISION that depends on what is on screen: clicking a specific button, " +
-        "reading a dialog, verifying that a previous action succeeded. The standard automation loop is " +
+        "PERFORMANCE TIPS — reduce token cost when full resolution isn't needed:\n" +
+        "  • 'scale=0.5' halves both dimensions (quarter of the pixels, ~4× smaller file).\n" +
+        "  • 'jpegQuality=75' switches to JPEG encoding (~10–20× smaller than PNG for typical UIs).\n" +
+        "  • Combine both: scale=0.5 jpegQuality=75 for maximum speed when just navigating.\n" +
+        "  • Use 'crop_screenshot' to capture only the region of interest.\n" +
+        "USE THIS BEFORE EVERY DECISION that depends on what is on screen. Standard loop:\n" +
         "screenshot → reason → act → screenshot to verify.\n" +
-        "Returns a text block with capture metadata (resolution, monitor bounds) plus the image itself.")]
+        "Returns a text block with capture metadata (resolution, format, file size) plus the image.")]
     public static IList<ContentBlock> ScreenshotScreen(
         [Description("If true, capture the entire virtual screen across all monitors. Default false (primary monitor only).")]
-        bool allMonitors = false)
+        bool allMonitors = false,
+        [Description("Downsample factor before encoding. 1.0 = full resolution (default). 0.5 = half width/height (~4× smaller). Range 0.1..1.0.")]
+        float scale = 1f,
+        [Description("JPEG quality 0–100. -1 (default) = lossless PNG. 75 gives good quality at ~15× smaller than PNG. 50 is acceptable for navigation shots.")]
+        int jpegQuality = -1)
     {
+        var gate = Enforcement.GateAny("screenshot_screen");
+        if (gate is not null) return new List<ContentBlock> { new TextContentBlock { Text = gate } };
+
         Rectangle bounds = allMonitors
             ? new Rectangle(
                 Win32.GetSystemMetrics(Win32.SM_XVIRTUALSCREEN),
@@ -333,31 +481,36 @@ public static class DesktopTools
         using (var g = Graphics.FromImage(bmp))
             g.CopyFromScreen(bounds.Location, Point.Empty, bounds.Size, CopyPixelOperation.SourceCopy);
 
-        return BuildImageResult(bmp, $"Captured {(allMonitors ? "virtual screen" : "primary monitor")} {bounds.Width}×{bounds.Height} at ({bounds.X},{bounds.Y}).");
+        return BuildImageResult(bmp,
+            $"Captured {(allMonitors ? "virtual screen" : "primary monitor")} {bounds.Width}×{bounds.Height} at ({bounds.X},{bounds.Y}).",
+            scale, jpegQuality);
     }
 
     [McpServerTool(Name = "screenshot_window")]
     [Description(
-        "Captures a PNG screenshot of a SPECIFIC application window — even if it is partially or fully " +
-        "covered by other windows or minimized. Returns the image inline.\n" +
+        "Captures a PNG (or JPEG) screenshot of a SPECIFIC application window — even if it is partially " +
+        "or fully covered by other windows or minimized. Returns the image inline.\n" +
         "Lookup strategy (tried in order against the supplied 'query'):\n" +
         "  1. Exact window-title match (case-insensitive)\n" +
         "  2. Exact process-name match (e.g. 'notepad', 'chrome' — no .exe needed)\n" +
         "  3. Substring window-title match\n" +
         "  4. Substring process-name match\n" +
-        "If the query is ambiguous, the tool returns a list of candidate windows (title + process + PID) " +
-        "instead of capturing — use those hints to refine 'query'.\n" +
-        "Use this when:\n" +
-        "  • You need the contents of a background app without raising it.\n" +
-        "  • You want to read a specific dialog by title (e.g. 'Save As').\n" +
-        "  • The full screen is noisy and you only care about one app.\n" +
+        "If the query is ambiguous, the tool returns a list of candidate windows (title + process + PID).\n" +
+        "PERFORMANCE TIPS:\n" +
+        "  • 'scale=0.5' halves both dimensions (~4× smaller file). Use for navigation / orientation.\n" +
+        "  • 'jpegQuality=75' gives good quality at ~15× smaller than PNG. Use when you need to read text.\n" +
+        "  • Use 'crop_screenshot' with window=query to capture a sub-region of the window.\n" +
         "Capture method: PrintWindow with PW_RENDERFULLCONTENT, which works for Win32, WPF, UWP, " +
         "Chromium/Electron and WebView2 surfaces. Minimized windows are temporarily restored.")]
     public static IList<ContentBlock> ScreenshotWindow(
         [Description("Window title or process name to find. Tried in order: exact title → exact process → substring title → substring process. Examples: 'Calculator', 'Save As', 'notepad', 'Visual Studio Code'.")]
         string query,
-        [Description("If true, also bring the window to the foreground after capture (useful when the next step is to interact with it). Default false.")]
-        bool activate = false)
+        [Description("If true, also bring the window to the foreground after capture. Default false.")]
+        bool activate = false,
+        [Description("Downsample factor before encoding. 1.0 = full resolution (default). 0.5 = half. Range 0.1..1.0.")]
+        float scale = 1f,
+        [Description("JPEG quality 0–100. -1 (default) = lossless PNG. 75 = good quality, ~15× smaller.")]
+        int jpegQuality = -1)
     {
         if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is required.");
         var windows = EnumerateTopLevelWindows();
@@ -383,6 +536,9 @@ public static class DesktopTools
             }
             return new List<ContentBlock> { new TextContentBlock { Text = msg.ToString() } };
         }
+
+        var gate = Enforcement.GateTarget(WindowControl.IsControlled(match.Hwnd), match.Title, "screenshot_window");
+        if (gate is not null) return new List<ContentBlock> { new TextContentBlock { Text = gate } };
 
         if (Win32.IsIconic(match.Hwnd)) Win32.ShowWindow(match.Hwnd, Win32.SW_RESTORE);
 
@@ -416,7 +572,264 @@ public static class DesktopTools
         if (activate) Win32.SetForegroundWindow(match.Hwnd);
 
         var meta = $"Captured window '{match.Title}' [{match.ProcessName}.exe, PID {match.Pid}] — {w0}×{h0} at ({rect.Left},{rect.Top}). Method={(printOk ? "PrintWindow" : "ScreenCopy")}.";
-        return BuildImageResult(bmp, meta);
+        return BuildImageResult(bmp, meta, scale, jpegQuality);
+    }
+
+    [McpServerTool(Name = "crop_screenshot")]
+    [Description(
+        "Captures a rectangular SUB-REGION of the screen or a specific window and returns it inline.\n" +
+        "This is the #1 tool for reducing token cost: instead of sending a full 2256×1504 screenshot, " +
+        "send only the 300×200 region that actually contains the button / dialog / element you care about.\n" +
+        "Coordinate modes:\n" +
+        "  • 'window' not set → x, y are absolute SCREEN coordinates (physical pixels).\n" +
+        "  • 'window' set → x, y are WINDOW-RELATIVE coordinates (same origin as 'screenshot_window' PNG).\n" +
+        "    The tool resolves the window, reads its DWM frame origin, and adds (x,y) to it.\n" +
+        "Typical workflow:\n" +
+        "  1. screenshot_window scale=0.5 to orient yourself.\n" +
+        "  2. Identify the region of interest (e.g. the confirmation dialog at window-coords 200,150).\n" +
+        "  3. crop_screenshot window='MyApp' x=200 y=150 width=400 height=200 to read it at full res.\n" +
+        "Returns a text block with origin, size, format metadata and the image.")]
+    public static IList<ContentBlock> CropScreenshot(
+        [Description("Left edge of the crop rectangle. Screen coordinates if 'window' is not set; window-relative otherwise.")]
+        int x,
+        [Description("Top edge of the crop rectangle.")]
+        int y,
+        [Description("Width of the crop rectangle in pixels. Range 1..8000.")]
+        int width,
+        [Description("Height of the crop rectangle in pixels. Range 1..8000.")]
+        int height,
+        [Description("Optional window title or process name. When set, x/y are window-relative coordinates (matching 'screenshot_window' PNG origin). When omitted, x/y are absolute screen coordinates.")]
+        string? window = null,
+        [Description("Downsample factor before encoding. 1.0 = full resolution (default). 0.5 = half. Range 0.1..1.0.")]
+        float scale = 1f,
+        [Description("JPEG quality 0–100. -1 (default) = lossless PNG. 75 = good quality, much smaller.")]
+        int jpegQuality = -1)
+    {
+        if (width  < 1 || width  > 8000) throw new ArgumentOutOfRangeException(nameof(width),  "width must be 1..8000.");
+        if (height < 1 || height > 8000) throw new ArgumentOutOfRangeException(nameof(height), "height must be 1..8000.");
+
+        // Resolve window-relative → absolute screen coords if a window is specified.
+        int screenX = x, screenY = y;
+        string originLabel;
+        if (!string.IsNullOrWhiteSpace(window))
+        {
+            var match = ResolveWindowOrThrow(window);
+
+            var gate = Enforcement.GateTarget(WindowControl.IsControlled(match.Hwnd), match.Title, "crop_screenshot");
+            if (gate is not null) return new List<ContentBlock> { new TextContentBlock { Text = gate } };
+
+            if (Win32.DwmGetWindowAttribute(match.Hwnd, Win32.DWMWA_EXTENDED_FRAME_BOUNDS, out var wr, Marshal.SizeOf<Win32.RECT>()) != 0
+                || wr.Width <= 0)
+            {
+                Win32.GetWindowRect(match.Hwnd, out wr);
+            }
+            screenX = wr.Left + x;
+            screenY = wr.Top  + y;
+            originLabel = $"window '{match.Title}' origin ({wr.Left},{wr.Top}) + ({x},{y})";
+        }
+        else
+        {
+            var gate = Enforcement.GateAny("crop_screenshot");
+            if (gate is not null) return new List<ContentBlock> { new TextContentBlock { Text = gate } };
+
+            originLabel = $"screen ({x},{y})";
+        }
+
+        // Clamp to virtual screen bounds so we never try to capture off-screen pixels.
+        int vx = Win32.GetSystemMetrics(Win32.SM_XVIRTUALSCREEN);
+        int vy = Win32.GetSystemMetrics(Win32.SM_YVIRTUALSCREEN);
+        int vw = Win32.GetSystemMetrics(Win32.SM_CXVIRTUALSCREEN);
+        int vh = Win32.GetSystemMetrics(Win32.SM_CYVIRTUALSCREEN);
+        int cx = Math.Clamp(screenX, vx, vx + vw - 1);
+        int cy = Math.Clamp(screenY, vy, vy + vh - 1);
+        int cw = Math.Min(width,  vx + vw - cx);
+        int ch = Math.Min(height, vy + vh - cy);
+        if (cw < 1 || ch < 1) throw new ArgumentException($"Crop rect ({screenX},{screenY} {width}×{height}) is entirely outside the virtual screen bounds.");
+
+        using var bmp = new Bitmap(cw, ch, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(bmp))
+            g.CopyFromScreen(cx, cy, 0, 0, new Size(cw, ch), CopyPixelOperation.SourceCopy);
+
+        return BuildImageResult(bmp,
+            $"Crop {cw}×{ch} at {originLabel}.",
+            scale, jpegQuality);
+    }
+
+    [McpServerTool(Name = "find_window")]
+    [Description(
+        "Lists visible top-level windows WITHOUT capturing any pixels. Returns title, process, PID, " +
+        "and screen position for each match.\n" +
+        "Use this to:\n" +
+        "  • Orient yourself before a screenshot ('what windows are open right now?').\n" +
+        "  • Verify a window exists before trying to capture or click it.\n" +
+        "  • Find the exact title to pass to 'screenshot_window' or 'click_in_window'.\n" +
+        "  • List all running apps quickly (no image tokens consumed).\n" +
+        "Supply 'filter' to narrow results; omit it to list everything.\n" +
+        "Returns a formatted text list — no image payload.")]
+    public static string FindWindow(
+        [Description("Optional substring filter applied to window title AND process name (case-insensitive). Omit to list ALL visible windows.")]
+        string? filter = null,
+        [Description("Maximum number of windows to return. Default 30. Range 1..200.")]
+        int maxResults = 30)
+    {
+        if (maxResults < 1 || maxResults > 200) throw new ArgumentOutOfRangeException(nameof(maxResults), "maxResults must be 1..200.");
+
+        var windows = EnumerateTopLevelWindows();
+        IEnumerable<WindowInfo> matches = windows;
+        if (!string.IsNullOrWhiteSpace(filter))
+        {
+            matches = windows.Where(w =>
+                w.Title.Contains(filter, StringComparison.OrdinalIgnoreCase) ||
+                w.ProcessName.Contains(filter, StringComparison.OrdinalIgnoreCase));
+        }
+        var list = matches.Take(maxResults).ToList();
+
+        if (list.Count == 0)
+        {
+            return string.IsNullOrWhiteSpace(filter)
+                ? "No visible windows found."
+                : $"No windows matched filter '{filter}'.";
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine(string.IsNullOrWhiteSpace(filter)
+            ? $"{list.Count} visible window(s){(windows.Count > maxResults ? $" (showing first {maxResults} of {windows.Count})" : "")}:"
+            : $"{list.Count} window(s) matching '{filter}'{(list.Count == maxResults ? $" (limit {maxResults})" : "")}:");
+
+        foreach (var w in list)
+        {
+            string sizeStr = "";
+            try
+            {
+                if (Win32.DwmGetWindowAttribute(w.Hwnd, Win32.DWMWA_EXTENDED_FRAME_BOUNDS, out var r, Marshal.SizeOf<Win32.RECT>()) == 0 && r.Width > 0)
+                    sizeStr = $" {r.Width}×{r.Height} at ({r.Left},{r.Top})";
+            }
+            catch { /* non-critical */ }
+            sb.AppendLine($"  • '{w.Title}' [{w.ProcessName}.exe, PID {w.Pid}]{sizeStr}");
+        }
+        return sb.ToString();
+    }
+
+    // ============================================================
+    //  WINDOW CONTROL (top-most + "Under Agent Control" frame)
+    // ============================================================
+
+    [McpServerTool(Name = "control_window")]
+    [Description(
+        "Takes exclusive visual control of ONE window: makes it TOP-MOST (stays above all other windows), " +
+        "brings it to the foreground, and draws a crimson border around it plus an 'Under Agent Control' " +
+        "tag with an ✕ button above its titlebar.\n" +
+        "WHY: agents frequently mis-click because the target window is in the background and another window " +
+        "is actually on top at those coordinates. Calling control_window FIRST guarantees the window you " +
+        "screenshot and click is the one on top, and shows the user exactly which window you are driving.\n" +
+        "RECOMMENDED WORKFLOW:\n" +
+        "  1. control_window query='Calculator'   ← pin it on top, frame it.\n" +
+        "  2. screenshot_window / click_in_window / send_keys …  ← do your work.\n" +
+        "  3. release_window query='Calculator'    ← YOU MUST DO THIS when finished.\n" +
+        "IMPORTANT — YOU MUST RELEASE: the window stays permanently top-most until you call " +
+        "'release_window' (or the user clicks the ✕ on the tag). Always release when you are done with a " +
+        "window. The frame follows the window as it moves/resizes and hides while it is minimized.\n" +
+        "Window lookup uses the same four-pass match as screenshot_window (exact title → exact process → " +
+        "substring title → substring process).")]
+    public static string ControlWindow(
+        [Description("Window title or process name to take control of. Examples: 'Calculator', 'Notepad', 'Visual Studio Code'.")]
+        string query)
+    {
+        if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is required.");
+
+        var abort = Enforcement.CheckAbort();
+        if (abort is not null) return abort;
+
+        var match = ResolveWindowOrThrow(query);
+        WindowControl.Acquire(match.Hwnd, match.Title);
+        return $"Window '{match.Title}' [{match.ProcessName}.exe, PID {match.Pid}] is now UNDER AGENT CONTROL: " +
+               $"set top-most, brought to front, crimson frame + 'Under Agent Control' tag shown.\n" +
+               $"⚠️ YOU MUST call release_window query='{match.Title}' (or all=true) when you finish — " +
+               $"otherwise it stays top-most permanently.";
+    }
+
+    [McpServerTool(Name = "release_window")]
+    [Description(
+        "Releases a window previously taken with 'control_window': removes the crimson frame + tag and " +
+        "restores the window's original top-most state (i.e. reverts it to NOT top-most unless it already " +
+        "was top-most before you controlled it).\n" +
+        "Call this the moment you are finished working with a controlled window. Pass 'all=true' to release " +
+        "every controlled window at once (do this before ending a task to be safe).")]
+    public static string ReleaseWindow(
+        [Description("Window title or process name to release. Optional if 'all' is true.")]
+        string? query = null,
+        [Description("If true, release ALL windows currently under agent control. Default false.")]
+        bool all = false)
+    {
+        if (all)
+        {
+            int n = WindowControl.ReleaseAll();
+            return n == 0 ? "No windows were under agent control." : $"Released {n} window(s); original states restored.";
+        }
+        if (string.IsNullOrWhiteSpace(query))
+            throw new ArgumentException("Provide 'query', or set all=true to release everything.");
+
+        var match = ResolveWindowOrThrow(query);
+        bool ok = WindowControl.Release(match.Hwnd);
+        return ok
+            ? $"Released '{match.Title}' [{match.ProcessName}.exe, PID {match.Pid}]; frame removed, top-most state restored."
+            : $"Window '{match.Title}' was not under agent control (nothing to release).";
+    }
+
+    [McpServerTool(Name = "record_window")]
+    [Description(
+        "Screen-records ONE window to an MP4 (H.264) file for a fixed duration, then returns the file path.\n" +
+        "Frames are captured with the same DWM-aware method as screenshot_window, so occluded / Chromium / " +
+        "UWP / WebView2 surfaces record correctly. The 'Under Agent Control' frame is NOT recorded (only the " +
+        "window's own pixels are captured).\n" +
+        "REQUIREMENTS:\n" +
+        "  • The window must be under agent control first (call control_window). This keeps it top-most and " +
+        "shows the user you are recording it.\n" +
+        "  • FFmpeg must be available (on PATH, or via the TOTALCONTROL_FFMPEG env var). Install: " +
+        "'winget install Gyan.FFmpeg'.\n" +
+        "ABORTABLE: if the user clicks ✕ on the control frame during recording, the capture stops early and " +
+        "the partial MP4 is still finalized.\n" +
+        "NOTE: this call BLOCKS for approximately 'durationSeconds'. Choose a bounded duration.")]
+    public static string RecordWindow(
+        [Description("Window title or process name to record. Must already be under agent control.")]
+        string query,
+        [Description("Recording length in seconds. Range 1..300.")]
+        int durationSeconds = 10,
+        [Description("Frames per second. Range 1..60. Default 15 (good balance of smoothness and file size).")]
+        int fps = 15,
+        [Description("Optional output .mp4 path. Default: %USERPROFILE%\\Videos\\TotalControl\\<title>_<timestamp>.mp4.")]
+        string? outputPath = null)
+    {
+        if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is required.");
+        if (durationSeconds < 1 || durationSeconds > 300) throw new ArgumentOutOfRangeException(nameof(durationSeconds), "durationSeconds must be 1..300.");
+        if (fps < 1 || fps > 60) throw new ArgumentOutOfRangeException(nameof(fps), "fps must be 1..60.");
+
+        var match = ResolveWindowOrThrow(query);
+
+        var gate = Enforcement.GateTarget(WindowControl.IsControlled(match.Hwnd), match.Title, "record_window");
+        if (gate is not null) return gate;
+
+        // Resolve output path.
+        string outPath;
+        if (!string.IsNullOrWhiteSpace(outputPath))
+        {
+            outPath = outputPath;
+            if (!outPath.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase)) outPath += ".mp4";
+        }
+        else
+        {
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "TotalControl");
+            var safe = string.Concat(match.Title.Split(Path.GetInvalidFileNameChars())).Trim();
+            if (safe.Length == 0) safe = "window";
+            if (safe.Length > 60) safe = safe[..60];
+            outPath = Path.Combine(dir, $"{safe}_{DateTime.Now:yyyyMMdd_HHmmss}.mp4");
+        }
+
+        using var cts = new CancellationTokenSource();
+        using (AgentSession.RegisterOperation(cts))
+        {
+            return ScreenRecorder.Record(match.Hwnd, match.Title, durationSeconds, fps, outPath, cts.Token);
+        }
     }
 
     // ============================================================
@@ -457,6 +870,9 @@ public static class DesktopTools
         if (string.IsNullOrWhiteSpace(query)) throw new ArgumentException("query is required.");
 
         var match = ResolveWindowOrThrow(query);
+
+        var gate = Enforcement.GateTarget(WindowControl.IsControlled(match.Hwnd), match.Title, "click_in_window");
+        if (gate is not null) return gate;
 
         // Same DWM-first rect logic as screenshot_window so the coordinate
         // spaces are guaranteed to align.
@@ -589,6 +1005,10 @@ public static class DesktopTools
         if (maxResults < 1 || maxResults > 100) throw new ArgumentOutOfRangeException(nameof(maxResults), "maxResults must be 1..100.");
 
         var match = ResolveWindowOrThrow(query);
+
+        var gate = Enforcement.GateTarget(WindowControl.IsControlled(match.Hwnd), match.Title, "find_element");
+        if (gate is not null) return gate;
+
         if (Win32.IsIconic(match.Hwnd)) Win32.ShowWindow(match.Hwnd, Win32.SW_RESTORE);
         if (activate) Win32.SetForegroundWindow(match.Hwnd);
 
@@ -861,6 +1281,15 @@ public static class DesktopTools
         int vy = Win32.GetSystemMetrics(Win32.SM_YVIRTUALSCREEN);
         int vw = Math.Max(1, Win32.GetSystemMetrics(Win32.SM_CXVIRTUALSCREEN));
         int vh = Math.Max(1, Win32.GetSystemMetrics(Win32.SM_CYVIRTUALSCREEN));
+        return AbsoluteMoveEventRaw(x, y, vx, vy, vw, vh);
+    }
+
+    /// <summary>
+    /// Like <see cref="AbsoluteMoveEvent"/> but takes pre-computed virtual-screen bounds so the
+    /// caller (e.g. drag_mouse) can cache the metrics once instead of re-reading them per step.
+    /// </summary>
+    private static Win32.INPUT AbsoluteMoveEventRaw(int x, int y, int vx, int vy, int vw, int vh)
+    {
         int ax = (int)Math.Round((x - vx) * 65535.0 / (vw - 1));
         int ay = (int)Math.Round((y - vy) * 65535.0 / (vh - 1));
         return new Win32.INPUT
@@ -899,6 +1328,8 @@ public static class DesktopTools
     /// Walk every visible top-level window and capture (hwnd, title, pid,
     /// process name). Invisible / cloaked / titleless windows are skipped to
     /// keep the candidate list focused on things the user actually sees.
+    /// Process names are resolved through <see cref="GetProcessName"/> which
+    /// caches results for 10 s to avoid repeated kernel calls on hot paths.
     /// </summary>
     private static List<WindowInfo> EnumerateTopLevelWindows()
     {
@@ -911,10 +1342,7 @@ public static class DesktopTools
             var sb = new StringBuilder(len + 1);
             Win32.GetWindowText(hWnd, sb, sb.Capacity);
             Win32.GetWindowThreadProcessId(hWnd, out var pid);
-            string pname;
-            try { using var pr = Process.GetProcessById((int)pid); pname = pr.ProcessName; }
-            catch { pname = "?"; }
-            list.Add(new WindowInfo(hWnd, sb.ToString(), pid, pname));
+            list.Add(new WindowInfo(hWnd, sb.ToString(), pid, GetProcessName(pid)));
             return true;
         }, IntPtr.Zero);
         return list;
@@ -944,23 +1372,67 @@ public static class DesktopTools
     }
 
     /// <summary>
-    /// Encode a bitmap as PNG and wrap it into the MCP content-block pair the
-    /// agent expects: a text block with capture metadata and an image block
-    /// the host renders inline. <see cref="ImageContentBlock.FromBytes"/> takes
-    /// raw image bytes and lazily base64-encodes them on serialization — the
-    /// SDK's <c>Data</c> property holds the encoded form, so we must NOT set
-    /// it directly with raw PNG bytes (the JsonConverter would write them as
-    /// a verbatim string and the host would see garbled output).
+    /// Encode a bitmap and wrap it into the MCP content-block pair the agent expects.
+    /// <paramref name="scale"/> downsamples before encoding (0.1–1.0; 1.0 = original size).
+    /// <paramref name="jpegQuality"/> selects JPEG encoding at 0–100 quality (-1 = lossless PNG).
     /// </summary>
-    private static IList<ContentBlock> BuildImageResult(Bitmap bmp, string metadata)
+    private static IList<ContentBlock> BuildImageResult(
+        Bitmap bmp, string metadata,
+        float scale = 1f, int jpegQuality = -1)
     {
-        using var ms = new MemoryStream();
-        bmp.Save(ms, ImageFormat.Png);
-        var bytes = ms.ToArray();
+        // Downsample if requested.
+        Bitmap workBmp = bmp;
+        bool ownWork = false;
+        if (scale is > 0f and < 1f)
+        {
+            int sw = Math.Max(1, (int)(bmp.Width  * scale));
+            int sh = Math.Max(1, (int)(bmp.Height * scale));
+            workBmp = new Bitmap(sw, sh, PixelFormat.Format32bppArgb);
+            ownWork = true;
+            using var g = Graphics.FromImage(workBmp);
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.DrawImage(bmp, 0, 0, sw, sh);
+        }
+
+        // Capture output dimensions NOW, before workBmp may be disposed below —
+        // reading them after Dispose() throws "Parameter is not valid".
+        int outW = workBmp.Width, outH = workBmp.Height;
+        int srcW = bmp.Width, srcH = bmp.Height;
+
+        string mimeType;
+        byte[] bytes;
+        try
+        {
+            using var ms = new MemoryStream();
+            if (jpegQuality >= 0)
+            {
+                mimeType = "image/jpeg";
+                var codec  = ImageCodecInfo.GetImageEncoders().First(e => e.MimeType == mimeType);
+                using var ep = new EncoderParameters(1);
+                ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, (long)Math.Clamp(jpegQuality, 0, 100));
+                workBmp.Save(ms, codec, ep);
+            }
+            else
+            {
+                mimeType = "image/png";
+                workBmp.Save(ms, ImageFormat.Png);
+            }
+            bytes = ms.ToArray();
+        }
+        finally
+        {
+            if (ownWork) workBmp.Dispose();
+        }
+
+        string fmt  = jpegQuality >= 0 ? $"JPEG q{jpegQuality}" : "PNG";
+        string dims = scale is > 0f and < 1f
+            ? $"{outW}×{outH} (scaled {scale:P0} from {srcW}×{srcH})"
+            : $"{srcW}×{srcH}";
+
         return new List<ContentBlock>
         {
-            new TextContentBlock { Text = metadata + $" PNG size: {bytes.Length / 1024} KB." },
-            ImageContentBlock.FromBytes(bytes, "image/png"),
+            new TextContentBlock { Text = metadata + $" {fmt} {dims}, {bytes.Length / 1024} KB." },
+            ImageContentBlock.FromBytes(bytes, mimeType),
         };
     }
 }

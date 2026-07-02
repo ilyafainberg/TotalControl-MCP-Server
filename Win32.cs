@@ -46,6 +46,7 @@ internal static class Win32
         MiddleDown  = 0x0020,
         MiddleUp    = 0x0040,
         Wheel       = 0x0800,
+        HWheel      = 0x01000, // horizontal scroll wheel
         VirtualDesk = 0x4000,  // pair with Absolute so coords span ALL monitors, not just primary
         Absolute    = 0x8000,
     }
@@ -117,6 +118,15 @@ internal static class Win32
     [DllImport("user32.dll")]
     public static extern bool SetCursorPos(int X, int Y);
 
+    /// <summary>
+    /// Translate a character to a virtual-key code (low byte) + shift state (high byte)
+    /// for the current keyboard layout. Used to send chorded keys (Ctrl+S, Win+R) as
+    /// real VK events so the OS hotkey/accelerator machinery recognizes them — Unicode
+    /// injection (wVk=0) is invisible to VK-based hotkey handlers. Returns -1 on failure.
+    /// </summary>
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern short VkKeyScanW(char ch);
+
     [DllImport("user32.dll")]
     public static extern bool GetCursorPos(out POINT lpPoint);
 
@@ -174,6 +184,50 @@ internal static class Win32
 
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    // =========================================================================
+    //  Window control — top-most, z-order, ex-styles, per-monitor DPI
+    //  (used by the control_window / release_window tools + overlay frames)
+    // =========================================================================
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+
+    /// <summary>Set window position, size and z-order. Used to make a target top-most and to glue overlays above it.</summary>
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    // Special hWndInsertAfter values.
+    public static readonly IntPtr HWND_TOP       = new(0);
+    public static readonly IntPtr HWND_BOTTOM    = new(1);
+    public static readonly IntPtr HWND_TOPMOST   = new(-1);
+    public static readonly IntPtr HWND_NOTOPMOST = new(-2);
+
+    // SetWindowPos flags.
+    public const uint SWP_NOSIZE     = 0x0001;
+    public const uint SWP_NOMOVE     = 0x0002;
+    public const uint SWP_NOZORDER   = 0x0004;
+    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_SHOWWINDOW = 0x0040;
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+    public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
+    public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+    public const int GWL_EXSTYLE = -20;
+
+    // Extended window styles used by the overlay frames.
+    public const int WS_EX_TOPMOST     = 0x00000008;
+    public const int WS_EX_TRANSPARENT = 0x00000020;   // click-through
+    public const int WS_EX_TOOLWINDOW  = 0x00000080;   // no taskbar / alt-tab entry
+    public const int WS_EX_LAYERED     = 0x00080000;
+    public const int WS_EX_NOACTIVATE  = 0x08000000;   // never steal activation
+
+    /// <summary>Per-monitor DPI of a window (Win10 1607+). 96 = 100%.</summary>
+    [DllImport("user32.dll")]
+    public static extern uint GetDpiForWindow(IntPtr hWnd);
 
     /// <summary>Resolves a window handle to the owning process id.</summary>
     [DllImport("user32.dll")]
