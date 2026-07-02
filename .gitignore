@@ -26,6 +26,9 @@ packages/
 _smoke_*.png
 _test_*.png
 _test_*.jpg
+_ctl_*.jpg
+_notepad_check.png
+test_*.py
 *.coverage
 TestResults/
 

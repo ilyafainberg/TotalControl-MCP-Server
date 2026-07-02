@@ -236,9 +236,9 @@ QuickBooks, SAP GUI, legacy WinForms LOB apps, installer wizards — if it
 runs on Windows, the agent can drive it. No "connector required",
 no "use the REST API instead", no extension points.
 
-> *"Open the Power Platform admin center, switch to the Production
-> environment, export the list of solutions to a CSV, save it to my
-> Downloads folder, then mail it to my manager."*
+> *"Open the admin console, switch to the Production environment, export
+> the list of records to a CSV, save it to my Downloads folder, then mail
+> it to my manager."*
 
 ### 2. Bridge two apps that don't know about each other
 
